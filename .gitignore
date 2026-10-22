@@ -1,0 +1,6 @@
+.env
+acr-credentials.yaml
+*.log
+.idea/
+.vscode/
+target/
