@@ -9,6 +9,7 @@ on:
       - "petstorepetservice/**"
       - "petstoreproductservice/**"
       - "petstoreorderservice/**"
+      - "orderitemsreserver/**"
       - ".github/workflows/build-push-images.yml"
 
   workflow_dispatch:
@@ -36,6 +37,9 @@ jobs:
 
           - image: petstoreorderservice
             context: ./petstoreorderservice
+
+          - image: orderitemsreserver
+            context: ./orderitemsreserver
 
     steps:
       - name: Check out repository
