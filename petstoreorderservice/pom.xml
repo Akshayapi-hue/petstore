@@ -57,6 +57,11 @@
             <artifactId>httpclient</artifactId>
             <version>${httpclient.version}</version>
         </dependency>
+	<dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-cosmos</artifactId>
+            <version>4.69.0</version>
+        </dependency>
     </dependencies>
 
     <build>

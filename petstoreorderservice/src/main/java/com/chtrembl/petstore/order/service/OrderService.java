@@ -1,13 +1,11 @@
 package com.chtrembl.petstore.order.service;
 
+import com.chtrembl.petstore.order.repository.CosmosOrderRepository;
 import com.chtrembl.petstore.order.exception.OrderNotFoundException;
 import com.chtrembl.petstore.order.model.Order;
 import com.chtrembl.petstore.order.model.Product;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -20,83 +18,44 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OrderService {
 
-    private static final String ORDERS = "orders";
-    private final CacheManager cacheManager;
+    private final CosmosOrderRepository orderRepository;
     private final ProductService productService;
 
-    @Cacheable(ORDERS)
-    public Order createOrder(String orderId) {
-        log.info("Creating new order with id: {} and caching it", orderId);
-        return Order.builder()
+        public Order createOrder(String orderId) {
+        log.info("Creating order in Cosmos DB: {}", orderId);
+
+        Order newOrder = Order.builder()
                 .id(orderId)
                 .products(new ArrayList<>())
                 .status(Order.Status.PLACED)
                 .complete(false)
                 .build();
-    }
 
-    /**
-     * Retrieves an existing order by ID. Does NOT create a new order if not found.
-     *
-     * @param orderId the order ID to retrieve
-     * @return the existing order
-     * @throws OrderNotFoundException if order does not exist
-     */
-    public Order getOrderById(String orderId) {
-        log.info("Retrieving order from cache: {}", orderId);
-
-        // Validate orderId (not covered by Bean Validation for path variables)
-        if (orderId == null || orderId.trim().isEmpty()) {
-            throw new IllegalArgumentException("Order ID cannot be null or empty");
-        }
-
-        // Try to get from cache
-        Cache cache = cacheManager.getCache(ORDERS);
-        if (cache != null) {
-            Cache.ValueWrapper wrapper = cache.get(orderId);
-            if (wrapper != null) {
-                Order cachedOrder = (Order) wrapper.get();
-                if (cachedOrder != null) {
-                    log.info("Found existing order: {}", orderId);
-                    return cachedOrder;
-                }
-            }
-        }
-
-        // Order not found - throw exception instead of creating new one
-        log.warn("Order not found: {}", orderId);
-        throw new OrderNotFoundException("Order with ID " + orderId + " not found");
-    }
-
-    /**
-     * Gets an existing order or creates a new one if it doesn't exist.
-     * Used internally for order updates.
-     */
-    public Order getOrCreateOrder(String orderId) {
-        log.info("Getting or creating order: {}", orderId);
-
-        // Try to get from cache first
-        Cache cache = cacheManager.getCache(ORDERS);
-        if (cache != null) {
-            Cache.ValueWrapper wrapper = cache.get(orderId);
-            if (wrapper != null) {
-                Order cachedOrder = (Order) wrapper.get();
-                if (cachedOrder != null) {
-                    log.info("Found existing order for update: {}", orderId);
-                    return cachedOrder;
-                }
-            }
-        }
-
-        // Create new order if not found
-        log.info("Creating new order for update: {}", orderId);
-        Order newOrder = createOrder(orderId);
-        if (cache != null) {
-            cache.put(orderId, newOrder);
-        }
-
+        orderRepository.save(newOrder);
         return newOrder;
     }
+
+    public Order getOrderById(String orderId) {
+        if (orderId == null || orderId.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Order ID cannot be null or empty");
+        }
+
+        return orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(
+                        "Order with ID " + orderId + " not found"));
+    }
+
+    public Order getOrCreateOrder(String orderId) {
+        if (orderId == null || orderId.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Order ID cannot be null or empty");
+        }
+
+        return orderRepository.findById(orderId)
+                .orElseGet(() -> createOrder(orderId));
+    }
+
 
     public Order updateOrder(Order order) {
         log.info("Updating order: {}", order.getId());
@@ -129,11 +88,9 @@ public class OrderService {
             updateOrderProducts(cachedOrder, order.getProducts());
         }
 
-        // Explicitly update cache
-        Cache cache = cacheManager.getCache(ORDERS);
-        if (cache != null) {
-            cache.put(order.getId(), cachedOrder);
-        }
+        // Persist the updated cart using the session ID as the order ID.
+        orderRepository.save(cachedOrder);
+        log.info("Saved order {} to Cosmos DB", cachedOrder.getId());
 
         return cachedOrder;
     }
