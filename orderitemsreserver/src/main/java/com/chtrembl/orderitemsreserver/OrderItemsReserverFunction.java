@@ -9,16 +9,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.microsoft.azure.functions.ExecutionContext;
-import com.microsoft.azure.functions.HttpMethod;
-import com.microsoft.azure.functions.HttpRequestMessage;
-import com.microsoft.azure.functions.HttpResponseMessage;
-import com.microsoft.azure.functions.HttpStatus;
-import com.microsoft.azure.functions.annotation.AuthorizationLevel;
 import com.microsoft.azure.functions.annotation.FunctionName;
-import com.microsoft.azure.functions.annotation.HttpTrigger;
+import com.microsoft.azure.functions.annotation.ServiceBusQueueTrigger;
 
 import java.time.Instant;
-import java.util.Optional;
 
 public class OrderItemsReserverFunction {
 
@@ -31,44 +25,38 @@ public class OrderItemsReserverFunction {
             "ORDER_BLOB_CONTAINER";
 
     private static final String DEFAULT_CONTAINER_NAME = "order-requests";
+    private static final int MAX_UPLOAD_ATTEMPTS = 3;
 
     @FunctionName("ReserveOrderItems")
-    public HttpResponseMessage reserveOrderItems(
-            @HttpTrigger(
-                    name = "request",
-                    methods = {HttpMethod.POST},
-                    authLevel = AuthorizationLevel.ANONYMOUS,
-                    route = "orders/reserve")
-            HttpRequestMessage<Optional<String>> request,
+    public void reserveOrderItems(
+            @ServiceBusQueueTrigger(
+                    name = "orderMessage",
+                    queueName = "order-reservations",
+                    connection = "SERVICE_BUS_CONNECTION")
+            String orderMessage,
             ExecutionContext context) {
 
-        try {
-            String requestBody = request.getBody().orElse(null);
+        String sessionId = "unknown";
 
-            if (requestBody == null || requestBody.isBlank()) {
-                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
-                        .header("Content-Type", "application/json")
-                        .body("{\"error\":\"Order request body is required\"}")
-                        .build();
+        try {
+            if (orderMessage == null || orderMessage.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Order message body is required");
             }
 
-            JsonNode incomingOrder = OBJECT_MAPPER.readTree(requestBody);
-            String sessionId = incomingOrder.path("id").asText();
+            JsonNode incomingOrder = OBJECT_MAPPER.readTree(orderMessage);
+            sessionId = incomingOrder.path("id").asText();
 
             if (sessionId == null || sessionId.isBlank()) {
-                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
-                        .header("Content-Type", "application/json")
-                        .body("{\"error\":\"Order id/session id is required\"}")
-                        .build();
+                throw new IllegalArgumentException(
+                        "Order id/session id is required");
             }
 
             JsonNode products = incomingOrder.path("products");
 
             if (!products.isArray()) {
-                return request.createResponseBuilder(HttpStatus.BAD_REQUEST)
-                        .header("Content-Type", "application/json")
-                        .body("{\"error\":\"Order products must be an array\"}")
-                        .build();
+                throw new IllegalArgumentException(
+                        "Order products must be an array");
             }
 
             String storageConnectionString =
@@ -76,16 +64,9 @@ public class OrderItemsReserverFunction {
 
             if (storageConnectionString == null
                     || storageConnectionString.isBlank()) {
-
-                context.getLogger().severe(
+                throw new IllegalStateException(
                         STORAGE_CONNECTION_STRING_SETTING
                                 + " is not configured");
-
-                return request.createResponseBuilder(
-                                HttpStatus.INTERNAL_SERVER_ERROR)
-                        .header("Content-Type", "application/json")
-                        .body("{\"error\":\"Storage is not configured\"}")
-                        .build();
             }
 
             String containerName =
@@ -114,69 +95,115 @@ public class OrderItemsReserverFunction {
                     "reservationStatus",
                     "RESERVED");
 
-            BlobContainerClient containerClient =
-                    new BlobContainerClientBuilder()
-                            .connectionString(storageConnectionString)
-                            .containerName(containerName)
-                            .buildClient();
-
-            containerClient.createIfNotExists();
-
             String safeSessionId = sessionId.replaceAll(
                     "[^A-Za-z0-9._-]",
                     "_");
 
             String blobName = safeSessionId + ".json";
 
-            BlobClient blobClient =
-                    containerClient.getBlobClient(blobName);
-
             String outputJson =
                     OBJECT_MAPPER
                             .writerWithDefaultPrettyPrinter()
                             .writeValueAsString(reservationRequest);
 
-            // overwrite = true ensures that the same session file is replaced
-            // after every shopping-cart update.
-            blobClient.upload(
-                    BinaryData.fromString(outputJson),
-                    true);
-
-            blobClient.setHttpHeaders(
-                    new BlobHttpHeaders()
-                            .setContentType(
-                                    "application/json; charset=utf-8"));
+            uploadWithRetry(
+                    storageConnectionString,
+                    containerName,
+                    blobName,
+                    outputJson,
+                    sessionId,
+                    context);
 
             context.getLogger().info(
-                    "Reservation file uploaded successfully. "
+                    "Reservation message processed successfully. "
                             + "Session: " + sessionId
                             + ", blob: " + blobName
-                            + ", product entries: "
-                            + products.size());
-
-            ObjectNode responseBody =
-                    OBJECT_MAPPER.createObjectNode();
-
-            responseBody.put("status", "reserved");
-            responseBody.put("sessionId", sessionId);
-            responseBody.put("blobName", blobName);
-            responseBody.put("productEntries", products.size());
-
-            return request.createResponseBuilder(HttpStatus.OK)
-                    .header("Content-Type", "application/json")
-                    .body(OBJECT_MAPPER.writeValueAsString(responseBody))
-                    .build();
+                            + ", product entries: " + products.size());
 
         } catch (Exception exception) {
             context.getLogger().severe(
-                    "Unable to reserve order items: "
-                            + exception.getMessage());
+                    "Order reservation processing failed for session "
+                            + sessionId + ": "
+                            + exception.getClass().getSimpleName());
 
-            return request.createResponseBuilder(
-                            HttpStatus.INTERNAL_SERVER_ERROR)
-                    .header("Content-Type", "application/json")
-                    .body("{\"error\":\"Unable to reserve order items\"}")
-                    .build();
+            /*
+             * Rethrowing marks Service Bus processing as failed.
+             * After the queue's maximum delivery count is reached,
+             * Service Bus moves the original order message to the DLQ.
+             */
+            throw new RuntimeException(
+                    "Unable to store order reservation after retries",
+                    exception);
         }
+    }
+
+    private void uploadWithRetry(
+            String storageConnectionString,
+            String containerName,
+            String blobName,
+            String outputJson,
+            String sessionId,
+            ExecutionContext context) throws Exception {
+
+        Exception lastException = null;
+
+        for (int attempt = 1;
+             attempt <= MAX_UPLOAD_ATTEMPTS;
+             attempt++) {
+
+            try {
+                BlobContainerClient containerClient =
+                        new BlobContainerClientBuilder()
+                                .connectionString(storageConnectionString)
+                                .containerName(containerName)
+                                .buildClient();
+
+                containerClient.createIfNotExists();
+
+                BlobClient blobClient =
+                        containerClient.getBlobClient(blobName);
+
+                // overwrite=true replaces the file for the same session.
+                blobClient.upload(
+                        BinaryData.fromString(outputJson),
+                        true);
+
+                blobClient.setHttpHeaders(
+                        new BlobHttpHeaders()
+                                .setContentType(
+                                        "application/json; charset=utf-8"));
+
+                context.getLogger().info(
+                        "Blob upload succeeded for session "
+                                + sessionId
+                                + " on attempt " + attempt);
+
+                return;
+
+            } catch (Exception exception) {
+                lastException = exception;
+
+                context.getLogger().warning(
+                        "Blob upload attempt " + attempt
+                                + " of " + MAX_UPLOAD_ATTEMPTS
+                                + " failed for session " + sessionId
+                                + ". Error type: "
+                                + exception.getClass().getSimpleName());
+
+                if (attempt < MAX_UPLOAD_ATTEMPTS) {
+                    try {
+                        Thread.sleep(1000L * attempt);
+                    } catch (InterruptedException interruptedException) {
+                        Thread.currentThread().interrupt();
+                        throw interruptedException;
+                    }
+                }
+            }
+        }
+
+        throw new IllegalStateException(
+                "Blob upload failed after "
+                        + MAX_UPLOAD_ATTEMPTS + " attempts",
+                lastException);
     }
 }

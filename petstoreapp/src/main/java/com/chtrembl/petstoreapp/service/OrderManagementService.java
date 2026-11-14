@@ -1,7 +1,6 @@
 package com.chtrembl.petstoreapp.service;
 
 import com.chtrembl.petstoreapp.client.OrderServiceClient;
-import com.chtrembl.petstoreapp.client.OrderItemsReserverClient;
 import com.chtrembl.petstoreapp.exception.OrderServiceException;
 import com.chtrembl.petstoreapp.model.Order;
 import com.chtrembl.petstoreapp.model.Product;
@@ -31,7 +30,7 @@ public class OrderManagementService {
 
     private final User sessionUser;
     private final OrderServiceClient orderServiceClient;
-    private final OrderItemsReserverClient orderItemsReserverClient;	
+    private final OrderReservationPublisher orderReservationPublisher;
 
     public void updateOrder(long productId, int quantity, boolean completeOrder) {
         MDC.put(OPERATION, "updateOrder");
@@ -50,16 +49,16 @@ public class OrderManagementService {
 
             Order resultOrder = orderServiceClient.createOrUpdateOrder(orderJSON);
             log.info("Successfully updated order: {}", resultOrder);
-		
-	    	String completeOrderJSON = serializeOrder(resultOrder);
-		String reservationResponse =
-       		 orderItemsReserverClient.reserveOrderItems(completeOrderJSON);
 
-log.info(
-        "Order items reservation updated for session {}: {}",
-        this.sessionUser.getSessionId(),
-        reservationResponse
-);
+            String completeOrderJSON = serializeOrder(resultOrder);
+
+            orderReservationPublisher.publish(
+                    completeOrderJSON,
+                    this.sessionUser.getSessionId());
+
+            log.info(
+                    "Order reservation message sent to Service Bus for session {}",
+                    this.sessionUser.getSessionId());
 
         } catch (FeignException fe) {
             log.error("Unable to update order via Feign client: HTTP {} - {}", fe.status(), fe.getMessage(), fe);
